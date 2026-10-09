@@ -3,7 +3,9 @@ mod host;
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context as _, Result, anyhow};
-use koharu_agent::{Account, Agent, Codex, CodexModel, Config, Control, Event, LoginEvent, RunId};
+use koharu_agent::{
+    Account, Agent, Chat, Codex, CodexModel, Config, Control, Event, LoginEvent, RunId,
+};
 use parking_lot::Mutex;
 use serde::Serialize;
 use specta::Type;
@@ -12,7 +14,8 @@ use tauri_runtime_cef::CefRuntime;
 use tokio::sync::Notify;
 
 use self::host::KoharuHost;
-use super::Error;
+use super::{Error, project::CurrentProject};
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Type)]
 pub struct AgentStatus {
@@ -20,6 +23,8 @@ pub struct AgentStatus {
     pub models: Vec<CodexModel>,
     pub config: Config,
     pub running: Option<RunId>,
+    pub chats: Vec<Chat>,
+    pub active_chat: Option<Uuid>,
 }
 
 pub(crate) struct AgentState {
@@ -27,16 +32,48 @@ pub(crate) struct AgentState {
     runs: Mutex<HashMap<RunId, Control>>,
     login: Mutex<Option<Control>>,
     idle: Notify,
+    handle: AppHandle<CefRuntime>,
+    scope: tokio::sync::Mutex<Option<String>>,
+    actions: tokio::sync::Mutex<()>,
 }
 
 impl AgentState {
     pub(crate) fn new(handle: AppHandle<CefRuntime>) -> Result<Self> {
         Ok(Self {
-            agent: Arc::new(Agent::new(Codex::new()?, KoharuHost::new(handle))?),
+            agent: Arc::new(Agent::new(Codex::new()?, KoharuHost::new(handle.clone()))?),
             runs: Mutex::new(HashMap::new()),
             login: Mutex::new(None),
             idle: Notify::new(),
+            handle,
+            scope: tokio::sync::Mutex::new(None),
+            actions: tokio::sync::Mutex::new(()),
         })
+    }
+
+    async fn ensure_history(&self) -> Result<()> {
+        let account = self.agent.codex().account()?;
+        let current = self.handle.state::<CurrentProject>();
+        let project = current.project.lock().await;
+        let scope = account
+            .as_ref()
+            .zip(project.as_ref())
+            .map(|(account, project)| {
+                serde_json::to_string(&(account.id.as_str(), project.info().name)).unwrap()
+            });
+        drop(project);
+        let mut loaded = self.scope.lock().await;
+        if *loaded != scope {
+            if let Some(scope) = &scope {
+                let root = dirs::data_dir()
+                    .context("no application data directory")?
+                    .join("Koharu/agent-chats");
+                self.agent.open_history(&root, scope).await?;
+            } else {
+                self.agent.clear().await;
+            }
+            *loaded = scope;
+        }
+        Ok(())
     }
 
     async fn status(&self) -> Result<AgentStatus> {
@@ -46,21 +83,22 @@ impl AgentState {
                 Ok(models) => models,
                 Err(error) => {
                     account = self.agent.codex().account()?;
-                    if account.is_some() {
-                        return Err(error);
-                    }
-                    self.agent.clear().await;
+                    tracing::warn!(%error, "could not refresh Agent models; saved chats remain available");
                     Vec::new()
                 }
             }
         } else {
             Vec::new()
         };
+        self.ensure_history().await?;
+        let running = self.runs.lock().keys().next().copied();
         Ok(AgentStatus {
             account,
             models,
             config: self.agent.config()?,
-            running: self.runs.lock().keys().next().copied(),
+            running,
+            chats: self.agent.chats().await,
+            active_chat: self.agent.selected_chat().await,
         })
     }
 
@@ -79,6 +117,7 @@ impl AgentState {
             idle.await;
         }
         self.agent.clear().await;
+        *self.scope.lock().await = None;
     }
 
     pub(crate) fn cancel_all(&self) {
@@ -191,6 +230,8 @@ pub(crate) async fn run_agent(
     if state.agent.codex().account()?.is_none() {
         return Err(anyhow!("Codex is not signed in").into());
     }
+    let _action = state.actions.lock().await;
+    state.ensure_history().await?;
     let run = RunId::new();
     let control = Control::default();
     {
@@ -245,4 +286,19 @@ pub(crate) async fn cancel_agent(
         .with_context(|| format!("agent run {run} is not active"))?
         .cancel();
     Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub(crate) async fn select_agent_chat(
+    id: Option<Uuid>,
+    state: State<'_, AgentState>,
+) -> std::result::Result<AgentStatus, Error> {
+    let _action = state.actions.lock().await;
+    if !state.runs.lock().is_empty() || state.login.lock().is_some() {
+        return Err(anyhow!("finish the current Agent request before switching chats").into());
+    }
+    state.ensure_history().await?;
+    state.agent.choose_chat(id).await?;
+    Ok(state.status().await?)
 }

@@ -1,6 +1,7 @@
 //! Koharu's in-process, OAuth-backed Codex agent.
 
 mod agent;
+mod history;
 mod codex;
 mod config;
 mod control;
@@ -11,3 +12,5 @@ pub use codex::{Account, Codex, CodexModel, LoginEvent};
 pub use config::{Config, Reasoning};
 pub use control::Control;
 pub use tool::{Host, Invocation, Tool, ToolCall, ToolImage};
+
+pub use history::{Chat, ChatMessage};

@@ -58,6 +58,7 @@ pub fn bindings() -> tauri_specta::Builder<tauri_runtime_cef::CefRuntime> {
     Builder::new()
         .commands(collect_commands![
             agent::get_agent_status,
+            agent::select_agent_chat,
             agent::login_agent,
             agent::logout_agent,
             agent::save_agent_config,

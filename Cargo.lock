@@ -4657,7 +4657,10 @@ version = "0.83.5"
 dependencies = [
  "anyhow",
  "async-trait",
+ "atomicwrites",
  "base64 0.23.1",
+ "blake3",
+ "dirs 7.0.0",
  "eventsource-stream",
  "futures",
  "koharu-config",
@@ -4667,6 +4670,7 @@ dependencies = [
  "serde",
  "serde_json",
  "specta",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

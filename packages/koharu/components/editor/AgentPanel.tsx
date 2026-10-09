@@ -1,12 +1,12 @@
 'use client'
 
 import { Channel } from '@tauri-apps/api/core'
-import { Bot, CircleStop, LogOut, Send, Sparkles } from 'lucide-react'
+import { Bot, CircleStop, LogOut, Plus, Send, Sparkles } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { call } from '@/lib/backend'
-import { pageKey, pagesKey, projectKey, refresh } from '@/lib/queries'
+import { pageKey, pagesKey, projectKey, refresh, useProject } from '@/lib/queries'
 import {
   commands,
   type AgentStatus,
@@ -37,6 +37,9 @@ interface ConversationMessage {
 
 export function AgentPanel() {
   const { t } = useTranslation()
+  const project = useProject().data
+  const [pending, setPending] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [status, setStatus] = useState<AgentStatus | null>(null)
   const [loginEvent, setLoginEvent] = useState<LoginEvent | null>(null)
   const [loggingIn, setLoggingIn] = useState(false)
@@ -46,10 +49,67 @@ export function AgentPanel() {
   const [activity, setActivity] = useState<string | null>(null)
 
   useEffect(() => {
+    let active = true
+    setStatus(null)
+    setMessages([])
+    setLoadError(null)
     void call(commands.getAgentStatus)
-      .then(setStatus)
-      .catch(() => undefined)
-  }, [])
+      .then((next) => {
+        if (active) restore(next)
+      })
+      .catch((error) => {
+        if (active) setLoadError(String(error))
+      })
+    return () => {
+      active = false
+    }
+  }, [project?.name])
+
+  useEffect(() => {
+    if (!running) return
+    let active = true
+    const timer = setInterval(() => {
+      void call(commands.getAgentStatus)
+        .then((next) => {
+          if (active && !next.running) {
+            restore(next)
+            setPending(false)
+            setActivity(null)
+          }
+        })
+        .catch(() => undefined)
+    }, 1500)
+    return () => {
+      active = false
+      clearInterval(timer)
+    }
+  }, [running])
+
+  function restore(next: AgentStatus) {
+    setStatus(next)
+    setRunning(next.running)
+    const chat = next.chats.find((chat) => chat.id === next.active_chat)
+    setMessages(
+      (chat?.messages ?? []).map((message, index) => ({
+        ...message,
+        id: `${chat?.id}-${index}`,
+        role: message.role as 'user' | 'assistant',
+      })),
+    )
+  }
+
+  async function chooseChat(id: string | null) {
+    setPending(true)
+    try {
+      restore(await call(commands.selectAgentChat, id))
+      setPrompt('')
+      setLoadError(null)
+    } catch (error) {
+      setLoadError(String(error))
+    } finally {
+      setPending(false)
+    }
+  }
 
   const selectedModel = useMemo(
     () =>
@@ -60,7 +120,7 @@ export function AgentPanel() {
   if (!status) {
     return (
       <div className='grid min-h-0 flex-1 place-items-center p-6 text-[11px] text-muted-foreground'>
-        {t('agent.loading')}
+        {loadError ?? t('agent.loading')}
       </div>
     )
   }
@@ -108,7 +168,7 @@ export function AgentPanel() {
             variant='ghost'
             size='icon-sm'
             aria-label={t('agent.signOut')}
-            disabled={running !== null}
+            disabled={running !== null || pending}
             onClick={() => void logout()}
           >
             <LogOut />
@@ -164,6 +224,36 @@ export function AgentPanel() {
         </div>
       </div>
 
+      <div className='flex shrink-0 items-center gap-1.5 border-b px-3 py-2'>
+        <select
+          aria-label='Chat history'
+          className='h-7 min-w-0 flex-1 rounded-md border bg-background px-2 text-[11px]'
+          value={status.active_chat ?? ''}
+          disabled={running !== null || pending}
+          onChange={(event) => void chooseChat(event.target.value)}
+        >
+          {!status.active_chat ? <option value=''>Chat history</option> : null}
+          {status.chats.map((chat) => (
+            <option key={chat.id} value={chat.id}>
+              {chat.title}
+            </option>
+          ))}
+        </select>
+        <Button
+          variant='ghost'
+          size='icon-sm'
+          aria-label='New chat'
+          disabled={running !== null || pending}
+          onClick={() => void chooseChat(null)}
+        >
+          <Plus />
+        </Button>
+      </div>
+      {loadError ? (
+        <p role='alert' className='px-3 py-2 text-xs text-destructive'>
+          {loadError}
+        </p>
+      ) : null}
       <ScrollArea className='min-h-0 flex-1'>
         {messages.length ? (
           <div className='grid gap-3 p-3'>
@@ -207,7 +297,7 @@ export function AgentPanel() {
           <Textarea
             id='agent-message'
             value={prompt}
-            disabled={running !== null}
+            disabled={running !== null || pending}
             aria-label={t('agent.message')}
             placeholder={t('agent.placeholder')}
             className='max-h-36 min-h-16 resize-none border-0 bg-transparent px-1.5 py-1 text-[11px] leading-5 shadow-none focus-visible:ring-0'
@@ -239,7 +329,7 @@ export function AgentPanel() {
               <Button
                 size='icon-sm'
                 aria-label={t('agent.send')}
-                disabled={!prompt.trim()}
+                disabled={!prompt.trim() || pending}
                 onClick={() => void send()}
               >
                 <Send />
@@ -257,7 +347,7 @@ export function AgentPanel() {
     const channel = new Channel<LoginEvent>()
     channel.onmessage = setLoginEvent
     try {
-      setStatus(await call(commands.loginAgent, channel))
+      restore(await call(commands.loginAgent, channel))
       setLoginEvent(null)
     } finally {
       setLoggingIn(false)
@@ -265,7 +355,7 @@ export function AgentPanel() {
   }
 
   async function logout() {
-    setStatus(await call(commands.logoutAgent))
+    restore(await call(commands.logoutAgent))
     setMessages([])
     setActivity(null)
   }
@@ -277,7 +367,8 @@ export function AgentPanel() {
 
   async function send() {
     const message = prompt.trim()
-    if (!message || running) return
+    if (!message || running || pending) return
+    setPending(true)
     const id = crypto.randomUUID()
     const assistant = crypto.randomUUID()
     let settled = false
@@ -291,6 +382,7 @@ export function AgentPanel() {
 
     const channel = new Channel<Event>()
     channel.onmessage = (event) => {
+      if (settled) return
       switch (event.type) {
         case 'started':
           setRunning(event.run)
@@ -313,6 +405,10 @@ export function AgentPanel() {
           updateAssistant(() => event.message)
           setRunning(null)
           setActivity(null)
+          setPending(false)
+          void call(commands.getAgentStatus)
+            .then(setStatus)
+            .catch((error) => setLoadError(String(error)))
           void refresh(projectKey, pagesKey, pageKey)
           break
         case 'failed':
@@ -320,12 +416,20 @@ export function AgentPanel() {
           updateAssistant(() => event.message, true)
           setRunning(null)
           setActivity(null)
+          setPending(false)
+          void call(commands.getAgentStatus)
+            .then(setStatus)
+            .catch((error) => setLoadError(String(error)))
           break
         case 'cancelled':
           settled = true
           updateAssistant((text) => text || t('agent.cancelled'))
           setRunning(null)
           setActivity(null)
+          setPending(false)
+          void call(commands.getAgentStatus)
+            .then(setStatus)
+            .catch((error) => setLoadError(String(error)))
           break
       }
     }
@@ -337,6 +441,7 @@ export function AgentPanel() {
       updateAssistant(() => (error instanceof Error ? error.message : t('agent.failed')), true)
       setRunning(null)
       setActivity(null)
+      setPending(false)
     }
 
     function updateAssistant(update: (text: string) => string, error = false) {

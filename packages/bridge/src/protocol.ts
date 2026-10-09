@@ -7,6 +7,7 @@ import { invoke as __TAURI_INVOKE, Channel } from "@tauri-apps/api/core";
 /** Commands */
 export const commands = {
 	getAgentStatus: () => __TAURI_INVOKE<AgentStatus>("get_agent_status"),
+	selectAgentChat: (id: string | null) => __TAURI_INVOKE<AgentStatus>("select_agent_chat", { id }),
 	loginAgent: (onEvent: Channel<LoginEvent>) => __TAURI_INVOKE<AgentStatus>("login_agent", { onEvent }),
 	logoutAgent: () => __TAURI_INVOKE<AgentStatus>("logout_agent"),
 	saveAgentConfig: (config: Config) => __TAURI_INVOKE<Config>("save_agent_config", { config }),
@@ -90,6 +91,8 @@ export type AgentStatus = {
 	models: CodexModel[],
 	config: Config,
 	running: RunId | null,
+	chats: Chat[],
+	active_chat: string | null,
 };
 
 export type AnalysisRegion = {
@@ -124,6 +127,19 @@ export type CanvasState = {
 	generation: number,
 	size: [number, number],
 	element_frames: TransformFrame[],
+};
+
+export type Chat = {
+	id: string,
+	title: string,
+	updated_at: string,
+	messages: ChatMessage[],
+};
+
+export type ChatMessage = {
+	role: string,
+	text: string,
+	error: boolean,
 };
 
 export type ClaudeConfig = Record<string, never>;

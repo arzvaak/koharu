@@ -12,6 +12,9 @@ keywords.workspace = true
 publish.workspace = true
 
 [dependencies]
+atomicwrites = { workspace = true }
+blake3 = { workspace = true }
+dirs = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -27,3 +30,6 @@ specta = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use specta::Type;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -104,7 +104,7 @@ pub struct Agent<H> {
     codex: Codex,
     host: Arc<H>,
     config: koharu_config::Config<Config>,
-    history: Mutex<Vec<Value>>,
+    history: Mutex<Option<crate::history::History>>,
     serial: Mutex<()>,
 }
 
@@ -117,7 +117,7 @@ where
             codex,
             host: Arc::new(host),
             config: Config::load()?,
-            history: Mutex::new(Vec::new()),
+            history: Mutex::new(None),
             serial: Mutex::new(()),
         })
     }
@@ -143,7 +143,42 @@ where
     }
 
     pub async fn clear(&self) {
-        self.history.lock().await.clear();
+        *self.history.lock().await = None;
+    }
+
+    pub async fn open_history(&self, root: &std::path::Path, scope: &str) -> Result<()> {
+        let _serial = self.serial.lock().await;
+        *self.history.lock().await = Some(crate::history::History::open(root, scope)?);
+        Ok(())
+    }
+
+    pub async fn chats(&self) -> Vec<crate::Chat> {
+        self.history
+            .lock()
+            .await
+            .as_ref()
+            .map(|history| history.chats())
+            .unwrap_or_default()
+    }
+
+    pub async fn selected_chat(&self) -> Option<Uuid> {
+        self.history
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|history| history.active().map(|chat| chat.id))
+    }
+
+    pub async fn choose_chat(&self, id: Option<Uuid>) -> Result<crate::Chat> {
+        let _serial = self.serial.lock().await;
+        let mut history = self.history.lock().await;
+        let history = history
+            .as_mut()
+            .context("open a project before starting a chat")?;
+        match id {
+            Some(id) => history.select(id),
+            None => history.start(),
+        }
     }
 
     #[tracing::instrument(skip_all)]
@@ -158,8 +193,44 @@ where
         F: FnMut(Event) + Send,
     {
         let _serial = self.serial.lock().await;
+        let started = async {
+            let mut history = self.history.lock().await;
+            history
+                .as_mut()
+                .context("open a project before chatting")?
+                .begin(&prompt)
+        }
+        .await;
+        if let Err(error) = started {
+            publish(Event::Failed {
+                run,
+                message: format!("{error:#}"),
+            });
+            return Err(error);
+        }
         publish(Event::Started { run });
-        let result = self.run_inner(run, prompt, &control, &mut publish).await;
+        let mut result = self
+            .run_inner(run, prompt.clone(), &control, &mut publish)
+            .await;
+        let (text, failed) = match &result {
+            Ok(result) => (result.message.clone(), false),
+            Err(_) if control.is_cancelled() => ("Request cancelled.".to_owned(), true),
+            Err(error) => (format!("{error:#}"), true),
+        };
+        if failed {
+            let saved = async {
+                let mut history = self.history.lock().await;
+                let history = history.as_mut().context("chat was closed during request")?;
+                let mut context = history.context();
+                context.push(message("user", &prompt));
+                context.push(message("assistant", &text));
+                history.finish(&text, true, context)
+            }
+            .await;
+            if let Err(error) = saved {
+                result = Err(error);
+            }
+        }
         match &result {
             Ok(result) => publish(Event::Completed {
                 run,
@@ -205,7 +276,13 @@ where
         };
         let clean_user = message("user", &prompt);
         let context_message = project_context(&context)?;
-        let base = self.history.lock().await.clone();
+        let base = self
+            .history
+            .lock()
+            .await
+            .as_ref()
+            .context("no chat selected")?
+            .context();
         let mut input = base.clone();
         input.push(context_message);
         input.push(clean_user.clone());
@@ -235,7 +312,12 @@ where
             persisted.extend(turn.output.iter().cloned());
 
             if turn.calls.is_empty() {
-                *self.history.lock().await = persisted;
+                self.history
+                    .lock()
+                    .await
+                    .as_mut()
+                    .context("no chat selected")?
+                    .finish(&turn.text, false, persisted)?;
                 return Ok(RunResult {
                     run,
                     message: turn.text,
